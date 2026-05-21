@@ -17,7 +17,10 @@ FINGERPRINT_MAP = {
     "random": "random", "": "chrome",
 }
 
-INFO_PAT = re.compile(r"(剩余流量|距离|套餐到期|导航页)", re.UNICODE)
+INFO_PAT = re.compile(
+    r"(剩余流量|距离|套餐到期|导航页|连不上|群组|官网|升级套餐|订阅地址|过期时间|"
+    r"剩余天数|官方|公告|提示|更新订阅|频道|telegram|t\.me|http[s]?://)",
+    re.UNICODE | re.IGNORECASE)
 
 def clean_tag(name):
     return name.strip()
@@ -32,8 +35,9 @@ def convert_vless(p):
         "server": p["server"],
         "server_port": int(p["port"]),
         "uuid": p["uuid"],
-        "packet_encoding": "xudp" if p.get("udp") else "",
     }
+    if p.get("udp"):
+        out["packet_encoding"] = "xudp"
     network = p.get("network", "tcp")
     reality_opts = p.get("reality-opts")
     if reality_opts:
@@ -78,8 +82,9 @@ def convert_vmess(p):
         "uuid": p["uuid"],
         "alter_id": int(p.get("alterId", 0)),
         "security": p.get("cipher", "auto"),
-        "packet_encoding": "xudp" if p.get("udp") else "",
     }
+    if p.get("udp"):
+        out["packet_encoding"] = "xudp"
     if p.get("tls"):
         out["tls"] = {"enabled": True, "server_name": p.get("servername", p["server"])}
     if p.get("network") == "ws":
@@ -101,7 +106,7 @@ def convert_ss(p):
     }
 
 def convert_trojan(p):
-    return {
+    out = {
         "type": "trojan",
         "tag": clean_tag(p["name"]),
         "server": p["server"],
@@ -112,46 +117,120 @@ def convert_trojan(p):
             "server_name": p.get("sni", p.get("servername", p["server"])),
         },
     }
+    if p.get("skip-cert-verify"):
+        out["tls"]["insecure"] = True
+    return out
+
+def convert_anytls(p):
+    """anytls 协议，sing-box 1.10+ 原生支持"""
+    out = {
+        "type": "anytls",
+        "tag": clean_tag(p["name"]),
+        "server": p["server"],
+        "server_port": int(p["port"]),
+        "password": p.get("password", ""),
+        "tls": {
+            "enabled": True,
+            "server_name": p.get("sni", p.get("servername", p["server"])),
+        },
+    }
+    if p.get("skip-cert-verify"):
+        out["tls"]["insecure"] = True
+    fp = p.get("client-fingerprint")
+    if fp:
+        out["tls"]["utls"] = {
+            "enabled": True,
+            "fingerprint": FINGERPRINT_MAP.get(fp, "chrome"),
+        }
+    return out
+
+def convert_tuic(p):
+    """tuic v5"""
+    out = {
+        "type": "tuic",
+        "tag": clean_tag(p["name"]),
+        "server": p["server"],
+        "server_port": int(p["port"]),
+        "uuid": p.get("uuid", ""),
+        "password": p.get("password", ""),
+        "congestion_control": p.get("congestion-controller", "bbr"),
+        "udp_relay_mode": p.get("udp-relay-mode", "native"),
+        "tls": {
+            "enabled": True,
+            "server_name": p.get("sni", p.get("servername", p["server"])),
+        },
+    }
+    if p.get("skip-cert-verify"):
+        out["tls"]["insecure"] = True
+    alpn = p.get("alpn")
+    if alpn:
+        out["tls"]["alpn"] = alpn if isinstance(alpn, list) else [alpn]
+    return out
 
 # ── proxy-groups ──────────────────────────────────────────
 
 def convert_groups(groups, proxy_tags):
     result = []
-    group_names = {g["name"] for g in groups}
-    for g in groups:
-        gtype = g.get("type", "select")
-        tag = clean_tag(g["name"])
-        raw = g.get("proxies", [])
-        outbounds = []
-        for p in raw:
-            pt = clean_tag(p)
-            if pt == "DIRECT":
-                outbounds.append("direct")
-            elif pt == "REJECT":
-                pass  # reject 现在是 rule action，不放进 outbounds
-            elif pt in proxy_tags or pt in group_names:
-                outbounds.append(pt)
+    dropped = set()  # 因为成员全空被丢弃的组名
 
-        if gtype == "select":
-            entry = {
-                "type": "selector",
-                "tag": tag,
-                "outbounds": outbounds,
-                "default": outbounds[0] if outbounds else "direct",
-            }
-        elif gtype in ("url-test", "fallback", "load-balance"):
-            entry = {
-                "type": "urltest",
-                "tag": tag,
-                "outbounds": outbounds,
-                "url": g.get("url", "https://www.gstatic.com/generate_204"),
-                "interval": "3m",
-                "idle_timeout": "30m",
-                "tolerance": 50,
-            }
-        else:
-            entry = {"type": "selector", "tag": tag, "outbounds": outbounds}
-        result.append(entry)
+    # 第一轮：确定哪些组是有效的
+    group_names = {g["name"] for g in groups}
+    # 第二轮可能要重做，简单起见循环到稳定
+    while True:
+        result = []
+        valid_group_names = set()
+        new_dropped = set(dropped)
+
+        for g in groups:
+            if g["name"] in new_dropped:
+                continue
+            gtype = g.get("type", "select")
+            tag = clean_tag(g["name"])
+            raw = g.get("proxies", [])
+            outbounds = []
+            for p in raw:
+                pt = clean_tag(p)
+                if pt == "DIRECT":
+                    outbounds.append("direct")
+                elif pt == "REJECT":
+                    pass
+                elif pt in proxy_tags:
+                    outbounds.append(pt)
+                elif pt in group_names and pt not in new_dropped:
+                    outbounds.append(pt)
+
+            if not outbounds:
+                new_dropped.add(g["name"])
+                continue
+
+            if gtype == "select":
+                entry = {
+                    "type": "selector",
+                    "tag": tag,
+                    "outbounds": outbounds,
+                    "default": outbounds[0],
+                }
+            elif gtype in ("url-test", "fallback", "load-balance"):
+                entry = {
+                    "type": "urltest",
+                    "tag": tag,
+                    "outbounds": outbounds,
+                    "url": g.get("url", "https://www.gstatic.com/generate_204"),
+                    "interval": "3m",
+                    "idle_timeout": "30m",
+                    "tolerance": 50,
+                }
+            else:
+                entry = {"type": "selector", "tag": tag, "outbounds": outbounds}
+            result.append(entry)
+            valid_group_names.add(g["name"])
+
+        if new_dropped == dropped:
+            break
+        dropped = new_dropped
+
+    if dropped:
+        print(f"⚠️  以下策略组因无可用节点已跳过: {', '.join(dropped)}")
     return result
 
 # ── rules ─────────────────────────────────────────────────
@@ -228,6 +307,7 @@ def convert(clash_path, output_path):
     # 1. 节点
     outbounds  = []
     proxy_tags = set()
+    skipped    = {}  # {协议名: 跳过数}
     for p in clash.get("proxies", []):
         if INFO_PAT.search(p.get("name", "")):
             continue
@@ -237,9 +317,18 @@ def convert(clash_path, output_path):
         elif ptype == "vmess":               node = convert_vmess(p)
         elif ptype in ("ss","shadowsocks"):  node = convert_ss(p)
         elif ptype == "trojan":              node = convert_trojan(p)
+        elif ptype == "anytls":              node = convert_anytls(p)
+        elif ptype == "tuic":                node = convert_tuic(p)
+        else:
+            skipped[ptype] = skipped.get(ptype, 0) + 1
         if node:
             outbounds.append(node)
             proxy_tags.add(node["tag"])
+
+    if skipped:
+        print("⚠️  以下协议 sing-box 不支持，已跳过：")
+        for t, n in skipped.items():
+            print(f"   {t}: {n} 个")
 
     # 2. proxy-groups
     groups          = clash.get("proxy-groups", [])
